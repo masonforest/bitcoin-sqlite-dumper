@@ -1,0 +1,18 @@
+[package]
+name = "utxo-dumper"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bitcoin = "0.31.1"
+db-key = "0.0.5"
+hex = "0.4.3"
+hex_lit = "0.1.1"
+leveldb = "0.8.6"
+rocksdb = "0.22.0"
+rusty-leveldb = "3.0.0"
+sled = "0.34.7"
+tempdir = "0.3.7"
+rusqlite = { version = "0.31.0", features = ["bundled"] }
