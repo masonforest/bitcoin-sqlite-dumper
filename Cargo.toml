@@ -6,13 +6,15 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-bitcoin = "0.31.1"
-db-key = "0.0.5"
 hex = "0.4.3"
 hex_lit = "0.1.1"
-leveldb = "0.8.6"
-rocksdb = "0.22.0"
-rusty-leveldb = "3.0.0"
-sled = "0.34.7"
-tempdir = "0.3.7"
+# The Level DB crate only supports i32 keys :/
+# See https://github.com/skade/leveldb/pull/52
+# and/or https://github.com/skade/leveldb/pull/53
+leveldb = { git = "https://github.com/cassc/leveldb.git", branch = "allow-impl-database-key" }
+walkdir = "2.3.2"
 rusqlite = { version = "0.31.0", features = ["bundled"] }
+tokio = {version = "*", features=["rt", "macros", "sync", "rt-multi-thread"]}
+indicatif = "0.17.8"
+futures = "*"
+tokio-stream = "*"

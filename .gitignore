@@ -1,1 +1,3 @@
 /target
+utxos.sqlite
+utxos.sqlite-journal
