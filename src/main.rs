@@ -1,10 +1,9 @@
-use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
+use itertools::Itertools;
 use leveldb::database::key::Key;
 use leveldb::{
     database::Database,
     iterator::Iterable,
-    kv::KV,
     options::{Options, ReadOptions},
 };
 use rusqlite::Connection;
@@ -14,59 +13,35 @@ use std::{
     path::Path,
     time::Duration,
 };
-use tokio::sync::{
-    mpsc,
-    mpsc::{Receiver, Sender},
-};
-use tokio_stream::wrappers::ReceiverStream;
 use walkdir::WalkDir;
 
 const OBFUSCATION_KEY: u8 = 14;
 const UTXO_KEY: u8 = 67;
 const BATCH_SIZE: usize = 10000;
 
-
 // https://github.com/bitcoin/bitcoin/blob/4cc99df44aec4d104590aee46cf18318e22a8568/src/dbwrapper.cpp#L323C19-L323C73
 // length + 0 + key
 
 const OBFUSCATE_KEY_KEY: [u8; 15] = *b"\x0E\0obfuscate_key";
 
-fn deobfuscate_value(value: Vec<u8>, obfuscate_key: &[u8]) -> Vec<u8> {
-    value
-        .bytes()
-        .enumerate()
-        .map(|(index, byte)| byte.unwrap() ^ (obfuscate_key[index % obfuscate_key.len()]))
-        .collect()
-}
-
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Utxo {
     tx_id: [u8; 32],
     vout: u16,
     coinbase: bool,
     height: u64,
     amount: u64,
-    script_type: u64,
-    script: Vec<u8>,
+    compressed_script: Vec<u8>,
 }
 impl Utxo {
-    fn decode(key: BtcKey, value: Vec<u8>) -> Utxo {
-        let (tx_id, vout) = if let KeyType::UtxoKey(tx_id, vout) = key.inner {
-            (tx_id, vout)
-        } else {
-            panic!("Can't decode {:?}", key.inner)
-        };
+    fn decode(tx_id: [u8; 32], vout: u16, value: Vec<u8>) -> Utxo {
         let mut cursor = Cursor::new(value.clone());
         let height_and_coinbase: u64 = read_varint(&mut cursor).unwrap();
         let height = height_and_coinbase >> 1;
         let coinbase = (height_and_coinbase & 1) != 0;
         let amount = decompress_amount(read_varint(&mut cursor).unwrap());
-        let script_type = read_varint(&mut cursor).unwrap();
-        if script_type != 0 {
-            cursor.seek(SeekFrom::Current(-1)).unwrap();
-        }
-        let mut script = Vec::new();
-        let _ = cursor.read_to_end(&mut script);
+        let mut compressed_script = Vec::new();
+        let _ = cursor.read_to_end(&mut compressed_script);
 
         Utxo {
             tx_id,
@@ -74,22 +49,9 @@ impl Utxo {
             coinbase,
             height,
             amount,
-            script_type,
-            script,
+            compressed_script,
         }
     }
-}
-fn get_obfuscation_key(db: &mut Database<BtcKey>) -> Vec<u8> {
-    let read_opts = ReadOptions::new();
-    db.get(
-        read_opts,
-        &BtcKey {
-            inner: KeyType::ObfuscationKey(OBFUSCATE_KEY_KEY),
-        },
-    )
-    .expect("obfuscation_key not set")
-    .unwrap()[1..]
-        .into()
 }
 
 //https://github.com/bitcoin/bitcoin/blob/4cc99df44aec4d104590aee46cf18318e22a8568/src/serialize.h#L464-L484
@@ -117,6 +79,7 @@ where
         }
     }
 }
+
 // https://github.com/bitcoin/bitcoin/blob/4cc99df44aec4d104590aee46cf18318e22a8568/src/compressor.cpp#L168-L192
 fn decompress_amount(mut x: u64) -> u64 {
     if x == 0 {
@@ -144,24 +107,51 @@ fn decompress_amount(mut x: u64) -> u64 {
 
     n
 }
+struct BtcDb<'a> {
+    iter: &'a mut leveldb::database::iterator::Iterator<'a, BtcKey>,
+    obfuscate_key: [u8; 8],
+}
 
-fn read_leveldb(db: &mut Database<BtcKey>, obfuscation_key: &[u8], sender: Sender<Utxo>) {
-    let mut iter = db.iter(ReadOptions::new());
-    let mut i = 0;
-    while let Some((k, obfuscated_value)) = iter.next() {
-        if let KeyType::UtxoKey(_, _) = k.inner {
-            i += 1;
-            let value = deobfuscate_value(obfuscated_value, obfuscation_key);
-            let new_sender = sender.clone();
-            tokio::spawn(async move {
-                new_sender.send(Utxo::decode(k, value)).await;
-            });
-            // println!("{}", i);
+impl<'a> BtcDb<'a> {
+    fn new(iter: &'a mut leveldb::database::iterator::Iterator<'a, BtcKey>) -> Self {
+        if let Some((BtcKey(KeyType::ObfuscationKey(OBFUSCATE_KEY_KEY)), obfuscate_key)) =
+            iter.next()
+        {
+            Self {
+                iter,
+                obfuscate_key: obfuscate_key[1..]
+                    .try_into()
+                    .expect("Obfuscate key was wrong length"),
+            }
+        } else {
+            panic!("Couldn't read obfuscate_key")
         }
+    }
+
+    fn deobfuscate(&self, value: Vec<u8>) -> Vec<u8> {
+        value
+            .bytes()
+            .enumerate()
+            .map(|(index, byte)| {
+                byte.unwrap() ^ (self.obfuscate_key[index % self.obfuscate_key.len()])
+            })
+            .collect()
+    }
+}
+impl Iterator for BtcDb<'_> {
+    type Item = Utxo;
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((key, value)) = self.iter.next() {
+            if let BtcKey(KeyType::UtxoKey(tx_id, vout)) = key {
+                return Some(Utxo::decode(tx_id, vout, self.deobfuscate(value)));
+            }
+        }
+
+        None
     }
 }
 
-async fn write_sqlite(conn: Connection, mut receiver: Receiver<Utxo>, size_hint: u64) {
+fn create_sqlite_db(conn: &Connection) {
     conn.execute(
         "CREATE TABLE utxos (
         transaction_id    BLOB,
@@ -169,61 +159,36 @@ async fn write_sqlite(conn: Connection, mut receiver: Receiver<Utxo>, size_hint:
         coinbase          BOOL,
         height            INTEGER,
         amount            INTEGER,
-        script_type       INTEGER,
+        n_size            INTEGER,
         compressed_script      BLOB,
         PRIMARY KEY (transaction_id, vout)
     )",
         (),
     )
     .unwrap();
-    let bar = ProgressBar::new(size_hint);
-    bar.enable_steady_tick(Duration::from_millis(100));
-    bar.set_style(
-        ProgressStyle::with_template(
-            "[{elapsed}/~{duration}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}",
-        )
-        .unwrap()
-        .progress_chars("##-"),
-    );
-    let mut i = 0;
-    conn.execute("BEGIN TRANSACTION;", ());
-    let mut stream = ReceiverStream::new(receiver).chunks(BATCH_SIZE);
-    while let Some(chunk) = stream.next().await {
-        bar.inc(BATCH_SIZE.try_into().unwrap());
-        for utxo in chunk {
-            {
-                let Utxo {
-                    tx_id,
-                    vout,
-                    coinbase,
-                    height,
-                    amount,
-                    script_type,
-                    script,
-                } = utxo;
-                i += 1;
-                conn.execute(
-                    "INSERT INTO utxos (
+}
+
+fn insert_utxo(conn: &Connection, utxo: &Utxo) {
+    if let Err(e) = conn.execute(
+        "INSERT INTO utxos (
                 transaction_id,
                 vout,
                 coinbase,
                 height,
                 amount,
-                script_type,
                 compressed_script
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    (tx_id, vout, coinbase, height, amount, script_type, script),
-                )
-                .unwrap();
-                // if (i % SQL_BATCH_SIZE == 0) {
-                // }
-            }
-        }
-                    conn.execute("COMMIT;", ());
-                    conn.execute("BEGIN TRANSACTION;", ());
-    }
-    conn.execute("COMMIT;", ());
-    bar.finish();
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        (
+            utxo.tx_id,
+            utxo.vout,
+            utxo.coinbase,
+            utxo.height,
+            utxo.amount,
+            &utxo.compressed_script,
+        ),
+    ) {
+        println!("Error executing insert: {:?}\nUTXO: {:?}", e, utxo)
+    };
 }
 
 #[derive(Clone, Debug)]
@@ -234,42 +199,40 @@ enum KeyType {
 }
 
 #[derive(Clone, Debug)]
-struct BtcKey {
-    inner: KeyType,
-}
+struct BtcKey(KeyType);
 
 impl Key for BtcKey {
     fn from_u8(inner: &[u8]) -> Self {
         match inner[0] {
-            OBFUSCATION_KEY => Self {
-                inner: KeyType::ObfuscationKey(inner.try_into().unwrap()),
+            OBFUSCATION_KEY => {
+                Self(KeyType::ObfuscationKey(inner.try_into().unwrap()))
             },
-            UTXO_KEY => Self {
-                inner: {
-                    let mut tx_id: [u8; 32] = inner[1..33].try_into().unwrap();
-                    // tx_id.reverse();
-                    let mut cursor = Cursor::new(inner[33..].to_vec().clone());
-                    let vout: u16 = read_varint(&mut cursor).unwrap().try_into().unwrap();
-                    KeyType::UtxoKey(tx_id, vout)
-                },
-            },
-            _ => Self {
-                inner: KeyType::UnknownKey,
-            },
+
+            UTXO_KEY => {
+                let tx_id: [u8; 32] = inner[1..33].try_into().unwrap();
+                // tx_id.reverse();
+                let mut cursor = Cursor::new(inner[33..].to_vec().clone());
+                let vout: u16 = read_varint(&mut cursor).unwrap().try_into().unwrap();
+                Self(KeyType::UtxoKey(tx_id, vout))
+            }
+
+            _ => Self(KeyType::UnknownKey),
         }
     }
 
     fn as_slice<T, F: Fn(&[u8]) -> T>(&self, f: F) -> T {
-        if let KeyType::ObfuscationKey(bytes) = self.inner {
+        if let KeyType::ObfuscationKey(bytes) = self.0 {
             f(&bytes)
         } else {
-            panic!("can't encode key {:?}", self.inner)
+            panic!("can't encode key {:?}", self.0)
         }
     }
 }
+
 fn get_size_hint<P: AsRef<Path>>(path: P) -> u64 {
     get_directory_size(path).unwrap() / 67 // each record is about 67 bytes
 }
+
 fn get_directory_size<P: AsRef<Path>>(path: P) -> std::io::Result<u64> {
     let mut size = 0;
 
@@ -285,16 +248,30 @@ fn get_directory_size<P: AsRef<Path>>(path: P) -> std::io::Result<u64> {
     Ok(size)
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let input_path = env::args().nth(1).unwrap();
     let output_path = env::args().nth(2).unwrap_or("utxos.sqlite".into());
-    let conn = Connection::open(output_path).unwrap();
-    let mut db: Database<BtcKey> = Database::open(Path::new(&input_path), Options::new()).unwrap();
+    let db: Database<BtcKey> = Database::open(Path::new(&input_path), Options::new()).unwrap();
+    let mut iter = db.iter(ReadOptions::new());
+    let mut btcdb = BtcDb::new(&mut iter);
     let size_hint = get_size_hint(input_path);
-    let obfuscation_key = get_obfuscation_key(&mut db);
-    let (tx, rx) = mpsc::channel::<Utxo>(BATCH_SIZE);
-    tokio::task::spawn_blocking(move ||{ read_leveldb(&mut db, &obfuscation_key, tx) });
-
-    write_sqlite(conn, rx, size_hint).await
+    let bar = ProgressBar::new(size_hint);
+    let conn = Connection::open(output_path).unwrap();
+    bar.enable_steady_tick(Duration::from_millis(100));
+    bar.set_style(
+        ProgressStyle::with_template(
+            "[{elapsed}/~{duration}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}",
+        )
+        .unwrap()
+        .progress_chars("##-"),
+    );
+    create_sqlite_db(&conn);
+    for chunk in &btcdb.chunks(BATCH_SIZE) {
+        bar.inc(BATCH_SIZE.try_into().unwrap());
+        conn.execute("BEGIN TRANSACTION;", ()).unwrap();
+        for utxo in chunk {
+            insert_utxo(&conn, &utxo)
+        }
+        conn.execute("COMMIT;", ()).unwrap();
+    }
 }
